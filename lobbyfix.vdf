@@ -1,0 +1,5 @@
+"Metamod Plugin"
+{
+	"alias"	"lobbyfix"
+	"file"	"addons/lobbyfix/lobbyfix"
+}
