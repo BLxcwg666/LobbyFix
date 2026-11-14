@@ -158,6 +158,51 @@ void AddPatch(const char *name, uint8_t *addr, const void *repl, size_t len)
 	p.applied = false;
 }
 
+bool FindSite(const char *name, const char *sig, uint8_t **out, char *error, size_t maxlen)
+{
+	int hits = FindUnique(sig, out);
+	if (hits != 1)
+	{
+		g_SMAPI->Format(error, maxlen, "%s signature matched %d times (expected 1)", name, hits);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Both builds: the "hibernation grace reservation" in CBaseServer::ReplyChallenge. When a challenge
+ * carries a reservation cookie ("connect0x<cookie>", e.g. a client using the main menu's reconnect after
+ * leaving a match) and the server isn't reserved yet, the server reserves itself for that cookie
+ * ("[R] Connect from ...") and reloads the map. With the lobby id patched to 0 the client's connect never
+ * carries the cookie, so it is rejected with #Valve_Reject_Reserved_For_Lobby, and so is every retry.
+ * The reservation step becomes a jump to where the code goes for sv_lan or an already reserved server:
+ * the target of the guard's IsReserved() jne.
+ */
+bool AddGraceReservationPatch(uint8_t *guard, size_t reservedJneOff, uint8_t *reserve, char *error, size_t maxlen)
+{
+	uint8_t *jne = guard + reservedJneOff;
+	if (jne[0] != 0x0F || jne[1] != 0x85)
+	{
+		g_SMAPI->Format(error, maxlen, "grace reservation guard has no jne at +0x%X", (unsigned)reservedJneOff);
+		return false;
+	}
+	int32_t rel;
+	memcpy(&rel, jne + 2, 4);
+	uint8_t *skip = jne + 6 + rel;
+	size_t distance = skip > reserve ? (size_t)(skip - reserve) : (size_t)(reserve - skip);
+	if (reserve <= guard || reserve - guard > 0x400 || skip == reserve || distance > 0x1000 ||
+		!InEngine((uintptr_t)skip, 1))
+	{
+		g_SMAPI->Format(error, maxlen, "grace reservation sites are not where expected");
+		return false;
+	}
+	uint8_t jmp[6] = {0xE9, 0, 0, 0, 0, 0x90}; // jmp skip; nop
+	int32_t jrel = (int32_t)(skip - (reserve + 5));
+	memcpy(jmp + 1, &jrel, 4);
+	AddPatch("grace reservation", reserve, jmp, sizeof(jmp));
+	return true;
+}
+
 #if defined _WIN32
 
 bool LocateEngine(char *error, size_t maxlen)
@@ -221,6 +266,13 @@ const size_t kOffLobbyIdHi = 0x59;
 const char *kSigIsExclusiveToLobby =
 	"8B 01 8B 40 5C FF D0 84 C0 75 01 C3 A1 ?? ?? ?? ?? B9 ?? ?? ?? ?? FF 50 34 85 C0 0F 94 C0 C3";
 
+// Grace reservation (see AddGraceReservationPatch). MSVC inlines IsExclusiveToLobbyConnections here: the
+// guard is the sv_lan check followed by the IsReserved() check.
+const char *kSigGraceGuard =
+	"A1 ?? ?? ?? ?? B9 ?? ?? ?? ?? FF 50 34 85 C0 0F 85 ?? ?? ?? ?? 8B 87 F0 02 00 00 0B 87 F4 02 00 00 0F 85 ?? ?? ?? ??";
+const size_t kOffGraceReservedJne = 0x21;
+const char *kSigGraceReserve = "8B 8F F8 02 00 00 85 C9 0F 84 ?? ?? ?? ?? 8B 01 0B 41 04 0F 84 ?? ?? ?? ??";
+
 bool AddImmToEmptyString(const char *name, uint8_t *immAddr, const char *expect, char *error, size_t maxlen)
 {
 	if (!PointsToString(immAddr, expect))
@@ -273,7 +325,13 @@ bool ResolvePlatformPatches(char *error, size_t maxlen)
 	}
 	const uint8_t retFalse[3] = {0x32, 0xC0, 0xC3}; // xor al, al; ret
 	AddPatch("IsExclusiveToLobbyConnections", exclusive, retFalse, sizeof(retFalse));
-	return true;
+
+	uint8_t *guard = nullptr;
+	uint8_t *reserve = nullptr;
+	if (!FindSite("grace reservation guard", kSigGraceGuard, &guard, error, maxlen) ||
+		!FindSite("grace reservation", kSigGraceReserve, &reserve, error, maxlen))
+		return false;
+	return AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen);
 }
 
 #else
@@ -339,10 +397,10 @@ bool WriteCode(uint8_t *dst, const uint8_t *src, size_t len)
 
 /*
  * gcc build. Unlike MSVC, gcc does not inline CBaseServer::IsExclusiveToLobbyConnections and
- * calls it from six places, including the hibernation grace-reservation logic in ReplyChallenge
- * that MSVC inlines and the Windows patch leaves alone. To match the Windows behaviour exactly,
- * only the three call sites that correspond to the Windows patches are neutralised
- * (call -> xor eax,eax), instead of patching the function body.
+ * calls it from six places, including the hibernation grace-reservation logic in ReplyChallenge.
+ * To match the Windows patches, three call sites are neutralised (call -> xor eax,eax) instead of
+ * patching the function body, and the grace reservation gets the same jump as on Windows; its guard's
+ * call is left alone so the connect-retry and LAN-only checks behind it still run.
  */
 const char *kSigReplyChallengeLobby =
 	"83 EC 0C BF ?? ?? ?? ?? 53 E8 ?? ?? ?? ?? 83 C4 10 84 C0 0F 85 B1 04 00 00 E8 ?? ?? ?? ?? 83 EC "
@@ -366,6 +424,12 @@ const char *kSigCookieCheck =
 	"0F 84 DA 1F";
 const size_t kOffCookieCall = 0x16;
 
+const char *kSigGraceGuard = "83 EC 0C 53 E8 ?? ?? ?? ?? 83 C4 10 84 C0 0F 84 ?? ?? ?? ?? 8B 83 F0 02 00 00 0B 83 EC 02 00 00 "
+							 "0F 85 ?? ?? ?? ??";
+const size_t kOffGraceGuardCall = 0x04;
+const size_t kOffGraceReservedJne = 0x20;
+const char *kSigGraceReserve = "8B 83 F4 02 00 00 85 C0 74 ?? 8B 50 04 0B 10 0F 85 ?? ?? ?? ??";
+
 const uint8_t kIsExclusivePrologue[] = {0x55, 0x89, 0xE5, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x8B, 0x10, 0x8B, 0x52, 0x60};
 
 uint8_t *CallTarget(uint8_t *call)
@@ -373,17 +437,6 @@ uint8_t *CallTarget(uint8_t *call)
 	int32_t rel;
 	memcpy(&rel, call + 1, 4);
 	return call + 5 + rel;
-}
-
-bool FindSite(const char *name, const char *sig, uint8_t **out, char *error, size_t maxlen)
-{
-	int hits = FindUnique(sig, out);
-	if (hits != 1)
-	{
-		g_SMAPI->Format(error, maxlen, "%s signature matched %d times (expected 1)", name, hits);
-		return false;
-	}
-	return true;
 }
 
 bool ResolvePlatformPatches(char *error, size_t maxlen)
@@ -442,7 +495,17 @@ bool ResolvePlatformPatches(char *error, size_t maxlen)
 		}
 		AddPatch(idNames[i], reply + off, &zero, 1);
 	}
-	return true;
+
+	uint8_t *guard = nullptr, *reserve = nullptr;
+	if (!FindSite("grace reservation guard", kSigGraceGuard, &guard, error, maxlen) ||
+		!FindSite("grace reservation", kSigGraceReserve, &reserve, error, maxlen))
+		return false;
+	if (guard[kOffGraceGuardCall] != 0xE8 || CallTarget(guard + kOffGraceGuardCall) != target)
+	{
+		g_SMAPI->Format(error, maxlen, "grace reservation guard does not call IsExclusiveToLobbyConnections");
+		return false;
+	}
+	return AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen);
 }
 
 #endif
