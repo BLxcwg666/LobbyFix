@@ -9,6 +9,11 @@ A [Metamod:Source](https://www.metamodsource.net/) plugin that makes **CS:GO leg
 
 Linux 没测，不知道能不能用
 
+## About this branch
+如果你在本地或者说局域网环境下或者说 N 层 NAT 之后的环境下开服务器并且使用了类似 frp 的内网穿透工具  
+并且你的客户端在加入时报 "Client dropped by server" 或者 "No user logon"  
+可以尝试使用本分支的构建
+
 ## License
 
 Public Domain
