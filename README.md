@@ -12,7 +12,8 @@ Linux 没测，不知道能不能用
 ## About auth issue
 如果你在本地 / 局域网 / N 层 NAT 之后的环境下开服务器并且使用了类似 frp 的内网穿透工具  
 并且你的客户端在加入时报 "Client dropped by server" 或者 "No user logon"  
-尝试在安装插件的同时在 srcds 启动参数里加上 `-lobbyfix_keepauth`（**Unsafe!** 请确保在受信任的网络环境中使用这个）  
+尝试在安装插件的同时在 srcds 启动参数里加上 `-lobbyfix_keepauth`  
+（**Unsafe!** 请确保在受信任的网络环境中使用这个）  
 
 ## License
 
