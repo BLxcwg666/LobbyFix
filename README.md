@@ -16,4 +16,4 @@ Linux 没测，不知道能不能用
 
 ## License
 
-Public Domain
+AGPL v3

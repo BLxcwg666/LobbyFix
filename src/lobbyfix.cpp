@@ -45,7 +45,7 @@ public:
 	const char *GetName() override { return "LobbyFix"; }
 	const char *GetDescription() override { return "Lets CS:GO legacy clients direct-connect without the GC lobby reservation"; }
 	const char *GetURL() override { return ""; }
-	const char *GetLicense() override { return "Public Domain"; }
+	const char *GetLicense() override { return "AGPL-3.0"; }
 	const char *GetVersion() override { return "1.4.0"; }
 	const char *GetDate() override { return LOBBYFIX_DATE; }
 	const char *GetLogTag() override { return "LOBBYFIX"; }
