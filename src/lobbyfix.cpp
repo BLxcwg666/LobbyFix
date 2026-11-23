@@ -46,7 +46,7 @@ public:
 	const char *GetDescription() override { return "Lets CS:GO legacy clients direct-connect without the GC lobby reservation"; }
 	const char *GetURL() override { return ""; }
 	const char *GetLicense() override { return "AGPL-3.0"; }
-	const char *GetVersion() override { return "1.4.0"; }
+	const char *GetVersion() override { return "1.5.0"; }
 	const char *GetDate() override { return LOBBYFIX_DATE; }
 	const char *GetLogTag() override { return "LOBBYFIX"; }
 };
@@ -79,7 +79,7 @@ struct EngineModule
 #endif
 };
 
-const size_t kMaxPatches = 10;
+const size_t kMaxPatches = 8;
 CodePatch g_patches[kMaxPatches];
 size_t g_numPatches = 0;
 EngineModule g_engine;
@@ -198,18 +198,19 @@ bool AddGraceReservationPatch(uint8_t *guard, size_t reservedJneOff, uint8_t *re
 
 const char *kSigAuthDropSwitch = "83 FE ?? 0F 87 ?? ?? ?? ?? FF 24 B5 ?? ?? ?? ??";
 
-bool AddAuthNetworkDropPatch(char *error, size_t maxlen)
+bool AddAuthKeepPatch(char *error, size_t maxlen)
 {
 	uint8_t bytes[32];
 	bool mask[32];
 	size_t len = 0;
 	if (!ParseSig(kSigAuthDropSwitch, bytes, mask, sizeof(bytes), &len))
 	{
-		g_SMAPI->Format(error, maxlen, "auth drop signature parse failed");
+		g_SMAPI->Format(error, maxlen, "auth keep signature parse failed");
 		return false;
 	}
 
 	uint8_t *match = nullptr;
+	uint8_t *matchKeep = nullptr;
 	int qualified = 0;
 	for (size_t i = 0; i + len <= g_engine.codeSize; i++)
 	{
@@ -229,16 +230,45 @@ bool AddAuthNetworkDropPatch(char *error, size_t maxlen)
 		uint8_t *deftgt = ja + 6 + rel;
 		if (!InEngine((uintptr_t)deftgt, 0x18))
 			continue;
-		bool pushesDropString = false;
+
+		size_t pushOff = 0x18;
 		for (size_t off = 0; off < 0x18; off++)
 		{
 			if (deftgt[off] == 0x68 && PointsToString(deftgt + off + 1, "Client dropped by server"))
 			{
-				pushesDropString = true;
+				pushOff = off;
 				break;
 			}
 		}
-		if (!pushesDropString)
+		if (pushOff == 0x18)
+			continue;
+
+		uint8_t *call = nullptr;
+		for (size_t off = pushOff + 5; off < pushOff + 7 && off + 3 <= 0x18; off++)
+		{
+			if (deftgt[off] == 0xFF && deftgt[off + 1] == 0x50 && deftgt[off + 2] == 0x3C)
+			{
+				call = deftgt + off;
+				break;
+			}
+		}
+		if (!call || !InEngine((uintptr_t)(call + 3), 8))
+			continue;
+		uint8_t *afterCall = call + 3;
+		uint8_t *keep;
+		if (afterCall[0] == 0x83 && afterCall[1] == 0xC4) // gcc: add esp, imm8; jmp <return>
+		{
+			uint8_t *gjmp = afterCall + 3;
+			if (gjmp[0] != 0xE9)
+				continue;
+			int32_t gr;
+			memcpy(&gr, gjmp + 1, 4);
+			keep = gjmp + 5 + gr;
+		}
+		else // msvc: the drop's Disconnect is thiscall, the epilogue follows it directly
+			keep = afterCall;
+		size_t keepDist = keep > deftgt ? (size_t)(keep - deftgt) : (size_t)(deftgt - keep);
+		if (!InEngine((uintptr_t)keep, 1) || keep == deftgt || keepDist > 0x400)
 			continue;
 
 		uint32_t tableAddr;
@@ -252,49 +282,19 @@ bool AddAuthNetworkDropPatch(char *error, size_t maxlen)
 			continue;
 
 		match = m;
+		matchKeep = keep;
 		qualified++;
 	}
 
 	if (qualified != 1)
 	{
-		g_SMAPI->Format(error, maxlen, "auth drop switch matched %d candidates (expected 1)", qualified);
+		g_SMAPI->Format(error, maxlen, "auth keep switch matched %d candidates (expected 1)", qualified);
 		return false;
 	}
 
-	uint8_t bound = match[2];
 	uint8_t *ja = match + 3;
-	uint32_t tableAddr;
-	memcpy(&tableAddr, match + 12, 4);
-	uint32_t lenient;
-	memcpy(&lenient, (const void *)(uintptr_t)(tableAddr + 4u * bound), 4);
-	int32_t newRel = (int32_t)(lenient - (uint32_t)(uintptr_t)(ja + 6));
-	AddPatch("steam auth network drop", ja + 2, &newRel, 4);
-	return true;
-}
-
-bool AddAuthKeepPatch(const char *sig, size_t jeOff, char *error, size_t maxlen)
-{
-	uint8_t *site = nullptr;
-	if (!FindSite("auth keep", sig, &site, error, maxlen))
-		return false;
-	uint8_t *je = site + jeOff;
-	if (je[0] != 0x0F || je[1] != 0x84)
-	{
-		g_SMAPI->Format(error, maxlen, "auth keep site has no je at +0x%X", (unsigned)jeOff);
-		return false;
-	}
-	int32_t rel;
-	memcpy(&rel, je + 2, 4);
-	uint8_t *keep = je + 6 + rel;
-	if (!InEngine((uintptr_t)keep, 1) || keep <= je || keep - je > 0x400)
-	{
-		g_SMAPI->Format(error, maxlen, "auth keep target is not where expected");
-		return false;
-	}
-	uint8_t jmp[6] = {0xE9, 0, 0, 0, 0, 0x90}; // jmp keep; nop
-	int32_t jrel = (int32_t)(keep - (je + 5));
-	memcpy(jmp + 1, &jrel, 4);
-	AddPatch("steam auth keep", je, jmp, sizeof(jmp));
+	int32_t newRel = (int32_t)(matchKeep - (ja + 6));
+	AddPatch("steam auth keep", ja + 2, &newRel, 4);
 	return true;
 }
 
@@ -405,12 +405,6 @@ const char *kSigGraceGuard =
 const size_t kOffGraceReservedJne = 0x21;
 const char *kSigGraceReserve = "8B 8F F8 02 00 00 85 C9 0F 84 ?? ?? ?? ?? 8B 01 0B 41 04 0F 84 ?? ?? ?? ??";
 
-// Auth-failure helper early-keep (see AddAuthKeepPatch): cmp [ecx+0x84],1 / push ebx,esi,edi /
-// je <keep>, anchored by the following "cmp byte [edi+0x353], 0" has-logon test.
-const char *kSigAuthKeep =
-	"83 B9 84 00 00 00 01 53 56 57 0F 84 ?? ?? ?? ?? 8B 7D 08 C6 45 FF 01 80 BF 53 03 00 00 00 0F 84";
-const size_t kOffAuthKeepJe = 0x0A;
-
 bool AddImmToEmptyString(const char *name, uint8_t *immAddr, const char *expect, char *error, size_t maxlen)
 {
 	if (!PointsToString(immAddr, expect))
@@ -471,13 +465,8 @@ bool ResolvePlatformPatches(char *error, size_t maxlen)
 		return false;
 	if (!AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen))
 		return false;
-	if (g_keepAuth)
-	{
-		if (!AddAuthNetworkDropPatch(error, maxlen))
-			return false;
-		if (!AddAuthKeepPatch(kSigAuthKeep, kOffAuthKeepJe, error, maxlen))
-			return false;
-	}
+	if (g_keepAuth && !AddAuthKeepPatch(error, maxlen))
+		return false;
 	return true;
 }
 
@@ -596,12 +585,6 @@ const size_t kOffGraceGuardCall = 0x04;
 const size_t kOffGraceReservedJne = 0x20;
 const char *kSigGraceReserve = "8B 83 F4 02 00 00 85 C0 74 ?? 8B 50 04 0B 10 0F 85 ?? ?? ?? ??";
 
-// Auth-failure helper early-keep (see AddAuthKeepPatch): cmp [eax+0x98],1 / je <keep>, anchored by the
-// following "cmp byte [ebx+0x33f], 0" has-logon test. gcc puts the register pushes at the function top,
-// so the je directly follows the cmp here.
-const char *kSigAuthKeep = "83 B8 98 00 00 00 01 0F 84 ?? ?? ?? ?? 80 BB 3F 03 00 00 00 75";
-const size_t kOffAuthKeepJe = 0x07;
-
 const uint8_t kIsExclusivePrologue[] = {0x55, 0x89, 0xE5, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x8B, 0x10, 0x8B, 0x52, 0x60};
 
 uint8_t *CallTarget(uint8_t *call)
@@ -679,13 +662,8 @@ bool ResolvePlatformPatches(char *error, size_t maxlen)
 	}
 	if (!AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen))
 		return false;
-	if (g_keepAuth)
-	{
-		if (!AddAuthNetworkDropPatch(error, maxlen))
-			return false;
-		if (!AddAuthKeepPatch(kSigAuthKeep, kOffAuthKeepJe, error, maxlen))
-			return false;
-	}
+	if (g_keepAuth && !AddAuthKeepPatch(error, maxlen))
+		return false;
 	return true;
 }
 
