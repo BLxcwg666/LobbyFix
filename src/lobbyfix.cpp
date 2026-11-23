@@ -1,6 +1,7 @@
 #if defined _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <link.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -12,7 +13,7 @@
 #include <ISmmPlugin.h>
 
 #ifndef LOBBYFIX_DATE
-#define LOBBYFIX_DATE "2026-11-14"
+#define LOBBYFIX_DATE "2026-11-24"
 #endif
 
 #if !defined _WIN32
@@ -45,7 +46,7 @@ public:
 	const char *GetDescription() override { return "Lets CS:GO legacy clients direct-connect without the GC lobby reservation"; }
 	const char *GetURL() override { return ""; }
 	const char *GetLicense() override { return "Public Domain"; }
-	const char *GetVersion() override { return "1.1.0"; }
+	const char *GetVersion() override { return "1.4.0"; }
 	const char *GetDate() override { return LOBBYFIX_DATE; }
 	const char *GetLogTag() override { return "LOBBYFIX"; }
 };
@@ -78,10 +79,11 @@ struct EngineModule
 #endif
 };
 
-const size_t kMaxPatches = 8;
+const size_t kMaxPatches = 10;
 CodePatch g_patches[kMaxPatches];
 size_t g_numPatches = 0;
 EngineModule g_engine;
+bool g_keepAuth = false;
 
 bool ParseSig(const char *sig, uint8_t *bytes, bool *mask, size_t cap, size_t *outLen)
 {
@@ -169,15 +171,6 @@ bool FindSite(const char *name, const char *sig, uint8_t **out, char *error, siz
 	return true;
 }
 
-/*
- * Both builds: the "hibernation grace reservation" in CBaseServer::ReplyChallenge. When a challenge
- * carries a reservation cookie ("connect0x<cookie>", e.g. a client using the main menu's reconnect after
- * leaving a match) and the server isn't reserved yet, the server reserves itself for that cookie
- * ("[R] Connect from ...") and reloads the map. With the lobby id patched to 0 the client's connect never
- * carries the cookie, so it is rejected with #Valve_Reject_Reserved_For_Lobby, and so is every retry.
- * The reservation step becomes a jump to where the code goes for sv_lan or an already reserved server:
- * the target of the guard's IsReserved() jne.
- */
 bool AddGraceReservationPatch(uint8_t *guard, size_t reservedJneOff, uint8_t *reserve, char *error, size_t maxlen)
 {
 	uint8_t *jne = guard + reservedJneOff;
@@ -201,6 +194,140 @@ bool AddGraceReservationPatch(uint8_t *guard, size_t reservedJneOff, uint8_t *re
 	memcpy(jmp + 1, &jrel, 4);
 	AddPatch("grace reservation", reserve, jmp, sizeof(jmp));
 	return true;
+}
+
+const char *kSigAuthDropSwitch = "83 FE ?? 0F 87 ?? ?? ?? ?? FF 24 B5 ?? ?? ?? ??";
+
+bool AddAuthNetworkDropPatch(char *error, size_t maxlen)
+{
+	uint8_t bytes[32];
+	bool mask[32];
+	size_t len = 0;
+	if (!ParseSig(kSigAuthDropSwitch, bytes, mask, sizeof(bytes), &len))
+	{
+		g_SMAPI->Format(error, maxlen, "auth drop signature parse failed");
+		return false;
+	}
+
+	uint8_t *match = nullptr;
+	int qualified = 0;
+	for (size_t i = 0; i + len <= g_engine.codeSize; i++)
+	{
+		uint8_t *m = g_engine.code + i;
+		size_t j = 0;
+		while (j < len && (!mask[j] || m[j] == bytes[j]))
+			j++;
+		if (j != len)
+			continue;
+
+		uint8_t bound = m[2];
+		if (bound == 0)
+			continue;
+		uint8_t *ja = m + 3;
+		int32_t rel;
+		memcpy(&rel, ja + 2, 4);
+		uint8_t *deftgt = ja + 6 + rel;
+		if (!InEngine((uintptr_t)deftgt, 0x18))
+			continue;
+		bool pushesDropString = false;
+		for (size_t off = 0; off < 0x18; off++)
+		{
+			if (deftgt[off] == 0x68 && PointsToString(deftgt + off + 1, "Client dropped by server"))
+			{
+				pushesDropString = true;
+				break;
+			}
+		}
+		if (!pushesDropString)
+			continue;
+
+		uint32_t tableAddr;
+		memcpy(&tableAddr, m + 12, 4);
+		if (!InEngine(tableAddr, (size_t)(bound + 1) * 4))
+			continue;
+		uint32_t lenient, lenientPrev;
+		memcpy(&lenient, (const void *)(uintptr_t)(tableAddr + 4u * bound), 4);
+		memcpy(&lenientPrev, (const void *)(uintptr_t)(tableAddr + 4u * (bound - 1)), 4);
+		if (lenient != lenientPrev || !InEngine(lenient, 1) || (uint8_t *)(uintptr_t)lenient == deftgt)
+			continue;
+
+		match = m;
+		qualified++;
+	}
+
+	if (qualified != 1)
+	{
+		g_SMAPI->Format(error, maxlen, "auth drop switch matched %d candidates (expected 1)", qualified);
+		return false;
+	}
+
+	uint8_t bound = match[2];
+	uint8_t *ja = match + 3;
+	uint32_t tableAddr;
+	memcpy(&tableAddr, match + 12, 4);
+	uint32_t lenient;
+	memcpy(&lenient, (const void *)(uintptr_t)(tableAddr + 4u * bound), 4);
+	int32_t newRel = (int32_t)(lenient - (uint32_t)(uintptr_t)(ja + 6));
+	AddPatch("steam auth network drop", ja + 2, &newRel, 4);
+	return true;
+}
+
+bool AddAuthKeepPatch(const char *sig, size_t jeOff, char *error, size_t maxlen)
+{
+	uint8_t *site = nullptr;
+	if (!FindSite("auth keep", sig, &site, error, maxlen))
+		return false;
+	uint8_t *je = site + jeOff;
+	if (je[0] != 0x0F || je[1] != 0x84)
+	{
+		g_SMAPI->Format(error, maxlen, "auth keep site has no je at +0x%X", (unsigned)jeOff);
+		return false;
+	}
+	int32_t rel;
+	memcpy(&rel, je + 2, 4);
+	uint8_t *keep = je + 6 + rel;
+	if (!InEngine((uintptr_t)keep, 1) || keep <= je || keep - je > 0x400)
+	{
+		g_SMAPI->Format(error, maxlen, "auth keep target is not where expected");
+		return false;
+	}
+	uint8_t jmp[6] = {0xE9, 0, 0, 0, 0, 0x90}; // jmp keep; nop
+	int32_t jrel = (int32_t)(keep - (je + 5));
+	memcpy(jmp + 1, &jrel, 4);
+	AddPatch("steam auth keep", je, jmp, sizeof(jmp));
+	return true;
+}
+
+bool CmdLineEnablesKeepAuth(const char *cmd)
+{
+	if (!cmd)
+		return false;
+	const char *name = "lobbyfix_keepauth";
+	size_t nlen = strlen(name);
+	for (const char *p = strstr(cmd, name); p; p = strstr(p + nlen, name))
+	{
+		char before = (p == cmd) ? ' ' : p[-1];
+		if (before != ' ' && before != '\t' && before != '-' && before != '+')
+			continue;
+		const char *after = p + nlen;
+		if (*after != '\0' && *after != ' ' && *after != '\t')
+			continue;
+		while (*after == ' ' || *after == '\t')
+			after++;
+		if (*after == '\0' || *after == '-' || *after == '+')
+			return true;
+		char val[8];
+		size_t k = 0;
+		while (after[k] && after[k] != ' ' && after[k] != '\t' && k < sizeof(val) - 1)
+		{
+			val[k] = after[k];
+			k++;
+		}
+		val[k] = '\0';
+		return strcmp(val, "0") != 0 && strcmp(val, "false") != 0 && strcmp(val, "off") != 0 &&
+			strcmp(val, "no") != 0;
+	}
+	return false;
 }
 
 #if defined _WIN32
@@ -244,6 +371,11 @@ bool WriteCode(uint8_t *dst, const uint8_t *src, size_t len)
 	return true;
 }
 
+bool KeepAuthEnabled()
+{
+	return CmdLineEnablesKeepAuth(GetCommandLineA());
+}
+
 /*
  * MSVC build. CBaseServer::ReplyChallenge picks the lobby type ("public"/"friends") inline and
  * writes a hard-coded lobby id of -1. Clients that see a non-empty lobby type or a non-zero
@@ -272,6 +404,12 @@ const char *kSigGraceGuard =
 	"A1 ?? ?? ?? ?? B9 ?? ?? ?? ?? FF 50 34 85 C0 0F 85 ?? ?? ?? ?? 8B 87 F0 02 00 00 0B 87 F4 02 00 00 0F 85 ?? ?? ?? ??";
 const size_t kOffGraceReservedJne = 0x21;
 const char *kSigGraceReserve = "8B 8F F8 02 00 00 85 C9 0F 84 ?? ?? ?? ?? 8B 01 0B 41 04 0F 84 ?? ?? ?? ??";
+
+// Auth-failure helper early-keep (see AddAuthKeepPatch): cmp [ecx+0x84],1 / push ebx,esi,edi /
+// je <keep>, anchored by the following "cmp byte [edi+0x353], 0" has-logon test.
+const char *kSigAuthKeep =
+	"83 B9 84 00 00 00 01 53 56 57 0F 84 ?? ?? ?? ?? 8B 7D 08 C6 45 FF 01 80 BF 53 03 00 00 00 0F 84";
+const size_t kOffAuthKeepJe = 0x0A;
 
 bool AddImmToEmptyString(const char *name, uint8_t *immAddr, const char *expect, char *error, size_t maxlen)
 {
@@ -331,7 +469,16 @@ bool ResolvePlatformPatches(char *error, size_t maxlen)
 	if (!FindSite("grace reservation guard", kSigGraceGuard, &guard, error, maxlen) ||
 		!FindSite("grace reservation", kSigGraceReserve, &reserve, error, maxlen))
 		return false;
-	return AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen);
+	if (!AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen))
+		return false;
+	if (g_keepAuth)
+	{
+		if (!AddAuthNetworkDropPatch(error, maxlen))
+			return false;
+		if (!AddAuthKeepPatch(kSigAuthKeep, kOffAuthKeepJe, error, maxlen))
+			return false;
+	}
+	return true;
 }
 
 #else
@@ -395,6 +542,25 @@ bool WriteCode(uint8_t *dst, const uint8_t *src, size_t len)
 	return true;
 }
 
+bool KeepAuthEnabled()
+{
+	char buf[8192];
+	int fd = open("/proc/self/cmdline", O_RDONLY);
+	if (fd < 0)
+		return false;
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return false;
+	for (ssize_t i = 0; i < n; i++)
+	{
+		if (buf[i] == '\0')
+			buf[i] = ' ';
+	}
+	buf[n] = '\0';
+	return CmdLineEnablesKeepAuth(buf);
+}
+
 /*
  * gcc build. Unlike MSVC, gcc does not inline CBaseServer::IsExclusiveToLobbyConnections and
  * calls it from six places, including the hibernation grace-reservation logic in ReplyChallenge.
@@ -429,6 +595,12 @@ const char *kSigGraceGuard = "83 EC 0C 53 E8 ?? ?? ?? ?? 83 C4 10 84 C0 0F 84 ??
 const size_t kOffGraceGuardCall = 0x04;
 const size_t kOffGraceReservedJne = 0x20;
 const char *kSigGraceReserve = "8B 83 F4 02 00 00 85 C0 74 ?? 8B 50 04 0B 10 0F 85 ?? ?? ?? ??";
+
+// Auth-failure helper early-keep (see AddAuthKeepPatch): cmp [eax+0x98],1 / je <keep>, anchored by the
+// following "cmp byte [ebx+0x33f], 0" has-logon test. gcc puts the register pushes at the function top,
+// so the je directly follows the cmp here.
+const char *kSigAuthKeep = "83 B8 98 00 00 00 01 0F 84 ?? ?? ?? ?? 80 BB 3F 03 00 00 00 75";
+const size_t kOffAuthKeepJe = 0x07;
 
 const uint8_t kIsExclusivePrologue[] = {0x55, 0x89, 0xE5, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x8B, 0x10, 0x8B, 0x52, 0x60};
 
@@ -505,7 +677,16 @@ bool ResolvePlatformPatches(char *error, size_t maxlen)
 		g_SMAPI->Format(error, maxlen, "grace reservation guard does not call IsExclusiveToLobbyConnections");
 		return false;
 	}
-	return AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen);
+	if (!AddGraceReservationPatch(guard, kOffGraceReservedJne, reserve, error, maxlen))
+		return false;
+	if (g_keepAuth)
+	{
+		if (!AddAuthNetworkDropPatch(error, maxlen))
+			return false;
+		if (!AddAuthKeepPatch(kSigAuthKeep, kOffAuthKeepJe, error, maxlen))
+			return false;
+	}
+	return true;
 }
 
 #endif
@@ -515,6 +696,7 @@ bool ResolvePatches(char *error, size_t maxlen)
 	g_numPatches = 0;
 	if (!LocateEngine(error, maxlen))
 		return false;
+	g_keepAuth = KeepAuthEnabled();
 	return ResolvePlatformPatches(error, maxlen);
 }
 
@@ -557,6 +739,8 @@ bool LobbyFixPlugin::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen
 	for (size_t i = 0; i < g_numPatches; i++)
 		META_CONPRINTF("[LobbyFix] patched %s at engine+0x%X\n", g_patches[i].name,
 			(unsigned)(g_patches[i].addr - g_engine.base));
+	META_CONPRINTF("[LobbyFix] keepAuth patches %s\n",
+		g_keepAuth ? "enabled (-lobbyfix_keepauth)" : "disabled (pass -lobbyfix_keepauth to enable)");
 	return true;
 }
 

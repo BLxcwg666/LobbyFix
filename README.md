@@ -10,9 +10,9 @@ A [Metamod:Source](https://www.metamodsource.net/) plugin that makes **CS:GO leg
 Linux 没测，不知道能不能用
 
 ## About auth issue
-如果你在本地或者说局域网环境下或者说 N 层 NAT 之后的环境下开服务器并且使用了类似 frp 的内网穿透工具  
+如果你在本地 / 局域网 / N 层 NAT 之后的环境下开服务器并且使用了类似 frp 的内网穿透工具  
 并且你的客户端在加入时报 "Client dropped by server" 或者 "No user logon"  
-可以尝试使用[该分支](https://github.com/BLxcwg666/LobbyFix/tree/keepAuth)的构建
+尝试在安装插件的同时在 srcds 启动参数里加上 `-lobbyfix_keepauth`  
 
 ## License
 
